@@ -1,0 +1,97 @@
+name: Setup and build APK
+
+# 一次性把工程从 IconShuffle-upload/ 挪到仓库根目录，并删掉残留的 zip；
+# 之后自动检查工程完整性、编译 debug APK。
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  setup-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Flatten project to repository root
+        run: |
+          set -euo pipefail
+          SRC="IconShuffle-upload"
+          if [ -d "$SRC" ]; then
+            echo "把 $SRC/ 下的内容挪到仓库根目录"
+            shopt -s dotglob nullglob
+            for item in "$SRC"/*; do
+              name="$(basename "$item")"
+              if [ -e "$name" ]; then rm -rf "$name"; fi
+              mv "$item" "$name"
+              echo "  moved $name"
+            done
+            rmdir "$SRC" || true
+          else
+            echo "$SRC 不存在，跳过（已经挪过了）"
+          fi
+          rm -f IconShuffle-upload.zip
+
+          echo "--- 挪完后的仓库结构 ---"
+          find . -path ./.git -prune -o -type f -print | sort
+
+      - name: Commit flatten result
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "没有需要提交的变化"
+          else
+            git commit -m "Flatten project to repository root"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      - name: Verify project files exist
+        run: |
+          set -euo pipefail
+          for f in settings.gradle.kts app/build.gradle.kts app/src/main/AndroidManifest.xml gradle/wrapper/gradle-wrapper.properties; do
+            if [ -f "$f" ]; then echo "[OK]   $f"; else echo "[MISS] $f"; MISSING=1; fi
+          done
+          if [ -n "${MISSING:-}" ]; then echo "工程文件不全，停止"; exit 1; fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+
+      # 本工程没提交 gradlew（二进制），缺了才生成
+      - name: Generate Gradle wrapper if missing
+        run: |
+          if [ ! -f ./gradlew ]; then
+            gradle wrapper --gradle-version 8.14.3 --no-daemon
+          fi
+          chmod +x ./gradlew
+
+      - name: Build debug APK
+        run: ./gradlew :app:assembleDebug --stacktrace
+
+      - name: Unit tests (does not block APK)
+        continue-on-error: true
+        run: ./gradlew :app:testDebugUnitTest --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: icon-shuffle-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 30
